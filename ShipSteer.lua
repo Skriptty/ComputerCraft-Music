@@ -1,16 +1,14 @@
 -- ship.lua
--- Save as /startup.lua on the ship computer
--- LEFT = turn left, RIGHT = turn right, BACK = forward thrust
-
 local TARGET_CHANNEL = 42
 local SHIP_CHANNEL = 50
 local TURN_LEFT = "left"
 local TURN_RIGHT = "right"
 local FORWARD = "back"
-local PULSE_TIME = 0.1
-local DEAD_ZONE = 5
-local INTERVAL = 0.5
-local CALIBRATION_TIME = 3  -- seconds to burn forward on startup
+local PULSE_TIME = 0.05
+local DEAD_ZONE = 15
+local STOP_DISTANCE = 5
+local INTERVAL = 1.0
+local HEADING_SMOOTH = 4
 
 local modem = peripheral.find("modem")
 if not modem then print("No modem!") return end
@@ -20,26 +18,38 @@ modem.open(SHIP_CHANNEL)
 
 local target = nil
 local ship = nil
-local lastShip = nil
-local calibrated = false
+local shipHistory = {}
 
-local function getBearing(x1, z1, x2, z2)
+local function addShipPos(x, z)
+  table.insert(shipHistory, {x = x, z = z})
+  if #shipHistory > HEADING_SMOOTH then
+    table.remove(shipHistory, 1)
+  end
+end
+
+local function getDistance(x1, z1, x2, z2)
   local dx = x2 - x1
   local dz = z2 - z1
-  local angle = math.deg(math.atan2(dx, -dz))
+  return math.sqrt(dx*dx + dz*dz)
+end
+
+local function getBearing(x1, z1, x2, z2)
+  local angle = math.deg(math.atan2(x2-x1, -(z2-z1)))
   return (angle + 360) % 360
 end
 
-local function getTurnDelta(current, target)
-  local delta = (target - current + 360) % 360
+local function getTurnDelta(current, tgt)
+  local delta = (tgt - current + 360) % 360
   if delta > 180 then delta = delta - 360 end
   return delta
 end
 
 local function getHeading()
-  if not ship or not lastShip then return nil end
-  local dx = ship.x - lastShip.x
-  local dz = ship.z - lastShip.z
+  if #shipHistory < 2 then return nil end
+  local first = shipHistory[1]
+  local last = shipHistory[#shipHistory]
+  local dx = last.x - first.x
+  local dz = last.z - first.z
   if math.abs(dx) < 1 and math.abs(dz) < 1 then return nil end
   return (math.deg(math.atan2(dx, -dz)) + 360) % 360
 end
@@ -50,19 +60,6 @@ local function stopAll()
   redstone.setOutput(FORWARD, false)
 end
 
-local function pulseLeft()
-  redstone.setOutput(TURN_LEFT, true)
-  os.sleep(PULSE_TIME)
-  redstone.setOutput(TURN_LEFT, false)
-end
-
-local function pulseRight()
-  redstone.setOutput(TURN_RIGHT, true)
-  os.sleep(PULSE_TIME)
-  redstone.setOutput(TURN_RIGHT, false)
-end
-
--- Listen for both ship and target positions
 local function listenLoop()
   while true do
     local event, side, ch, repCh, msg = os.pullEvent("modem_message")
@@ -70,70 +67,79 @@ local function listenLoop()
       if ch == TARGET_CHANNEL and msg.label then
         target = {x = msg.x, y = msg.y, z = msg.z}
       elseif ch == SHIP_CHANNEL and msg.label then
-        lastShip = ship
         ship = {x = msg.x, y = msg.y, z = msg.z}
+        addShipPos(msg.x, msg.z)
       end
     end
   end
 end
 
--- Calibration: burn forward until we have two distinct GPS positions
 local function calibrate()
   print("Calibrating heading...")
   redstone.setOutput(FORWARD, true)
-
-  -- Wait until we get two GPS reads with meaningful movement
   local attempts = 0
   while attempts < 20 do
     os.sleep(0.5)
     attempts = attempts + 1
-    if getHeading() then
-      break
-    end
+    if getHeading() then break end
   end
-
   redstone.setOutput(FORWARD, false)
-
   if getHeading() then
-    print("Calibrated! Heading: " .. math.floor(getHeading()) .. "°")
-    calibrated = true
+    print("Calibrated! Heading: " .. math.floor(getHeading()) .. "deg")
   else
-    print("Calibration failed - ship may not be moving.")
-    print("Steering will activate once movement detected.")
+    print("Calibration failed - will try once moving.")
   end
 end
 
--- Steering loop
 local function steerLoop()
-  -- Wait for first GPS fix from ship channel
   print("Waiting for ship GPS...")
-  while not ship do
-    os.sleep(0.5)
-  end
+  while not ship do os.sleep(0.5) end
 
   calibrate()
-
-  print("Steering active, tracking ch." .. TARGET_CHANNEL)
+  print("Steering active.")
 
   while true do
-    if target and ship then
-      local bearing = getBearing(ship.x, ship.z, target.x, target.z)
-      local heading = getHeading()
+    os.sleep(INTERVAL)
 
-      if heading then
-        local delta = getTurnDelta(heading, bearing)
-        if math.abs(delta) > DEAD_ZONE then
-          if delta < 0 then
-            pulseLeft()
+    if target and ship then
+      local dist = getDistance(ship.x, ship.z, target.x, target.z)
+
+      -- Close enough, stop everything
+      if dist <= STOP_DISTANCE then
+        stopAll()
+        print("Arrived at target.")
+
+      else
+        local bearing = getBearing(ship.x, ship.z, target.x, target.z)
+        local heading = getHeading()
+
+        if heading then
+          local delta = getTurnDelta(heading, bearing)
+          print(string.format("Dist: %dm | Heading: %d | Target: %d | Delta: %d",
+            math.floor(dist), math.floor(heading), math.floor(bearing), math.floor(delta)))
+
+          if math.abs(delta) > DEAD_ZONE then
+            -- Facing wrong way — turn only
+            redstone.setOutput(FORWARD, false)
+            if delta < 0 then
+              redstone.setOutput(TURN_RIGHT, false)
+              redstone.setOutput(TURN_LEFT, true)
+            else
+              redstone.setOutput(TURN_LEFT, false)
+              redstone.setOutput(TURN_RIGHT, true)
+            end
           else
-            pulseRight()
+            -- Facing target — thrust forward, stop turning
+            redstone.setOutput(TURN_LEFT, false)
+            redstone.setOutput(TURN_RIGHT, false)
+            redstone.setOutput(FORWARD, true)
           end
+
         else
-          stopAll()
+          print("No heading yet...")
         end
       end
     end
-    os.sleep(INTERVAL)
   end
 end
 
