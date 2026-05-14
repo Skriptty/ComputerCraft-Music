@@ -1,6 +1,6 @@
 -- startup.lua
 
-local CHANNEL = 50
+local CHANNEL = 42
 local INTERVAL = 30
 local LABEL = os.getComputerLabel() or ("Unit-" .. os.getComputerID())
 
